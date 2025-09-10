@@ -1,0 +1,702 @@
+import pygame
+import sys
+import random
+import matplotlib.pyplot as plt
+
+# Constants
+WIDTH, HEIGHT = 600, 700
+FPS = 60
+LANE_NUM = 6
+LANE_SIZE = 12
+ROAD_WIDTH = LANE_SIZE * LANE_NUM
+CAR_LENGTH, CAR_WIDTH = 12, 5.75
+BG_COLOR = (172, 219, 160)
+ROAD_COLOR = (50, 50, 50)
+LINE_COLOR = (255, 255, 255)
+BUTTON_COLOR = (70, 70, 70)
+BUTTON_HOVER = (100, 100, 100)
+BUTTON_TEXT = (255, 255, 255)
+MPH_TO_PPF = 1.4667 / FPS
+DATA_FRAME_X = WIDTH
+DATA_FRAME_Y = HEIGHT
+
+N_SPAWN_EVENT = pygame.USEREVENT + 1  
+S_SPAWN_EVENT = pygame.USEREVENT + 2
+N_SPAWN_INTERVAL = 350
+S_SPAWN_INTERVAL = 1000
+
+
+
+class Camera:
+    def __init__(self):
+        self.offset = pygame.Vector2(0, 0)
+        self.dragging = False
+        self.last_mouse = pygame.Vector2(0, 0)
+        self.zoom = 1.0
+
+    def apply(self, pos):
+        return (pos - self.offset) * self.zoom + pygame.Vector2(WIDTH / 2, HEIGHT / 2)
+
+    def handle_event(self, event):
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            if event.button == 1:
+                self.dragging = True
+                self.last_mouse = pygame.Vector2(event.pos)
+            elif event.button == 4:
+                self.zoom *= 1.1
+            elif event.button == 5:
+                self.zoom /= 1.1
+        elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+            self.dragging = False
+        elif event.type == pygame.MOUSEMOTION and self.dragging:
+            delta = (self.last_mouse - pygame.Vector2(event.pos)) / self.zoom
+            self.offset += delta
+            self.last_mouse = pygame.Vector2(event.pos)
+
+
+class Button:
+    def __init__(self, text, rect, action, font):
+        self.text = text
+        self.rect = pygame.Rect(rect)
+        self.action = action
+        self.font = font
+
+    def draw(self, screen):
+        color = BUTTON_HOVER if self.rect.collidepoint(pygame.mouse.get_pos()) else BUTTON_COLOR
+        pygame.draw.rect(screen, color, self.rect)
+        label = self.text() if callable(self.text) else self.text
+        txt = self.font.render(label, True, BUTTON_TEXT)
+        screen.blit(txt, txt.get_rect(center=self.rect.center))
+
+    def click(self, pos):
+        if self.rect.collidepoint(pos):
+            self.action()
+
+
+class Road:
+    def __init__(self, orientation, position, lanes, N_speed_limit_mph, S_speed_limit_mph):
+        self.orientation = orientation
+        self.position = position
+        self.lanes = lanes
+        self.N_speed_limit_mph = N_speed_limit_mph
+        self.S_speed_limit_mph = S_speed_limit_mph
+
+    def draw(self, screen, cam):
+        zoomed_width = max(1, int(2 * cam.zoom))
+        half_width = (ROAD_WIDTH / 2)
+        if self.orientation == 'v':
+            x = self.position
+            pygame.draw.rect(screen, ROAD_COLOR, pygame.Rect(
+                cam.apply(pygame.Vector2(x - half_width, -10000)),
+                (ROAD_WIDTH * cam.zoom, 20000 * cam.zoom)
+            ))
+            for i in range(1, self.lanes):
+                lx = x - half_width + i * (LANE_SIZE)
+                col = LINE_COLOR
+                for offset in [0]:
+                    p1 = cam.apply(pygame.Vector2(lx + offset, -10000))
+                    p2 = cam.apply(pygame.Vector2(lx + offset, 10000))
+                    pygame.draw.line(screen, col, p1, p2, zoomed_width)
+ 
+class Car(pygame.sprite.Sprite):
+    def __init__(self, pos, direction, speed, lane, reverse, road):
+        super().__init__()
+        self.base_image = pygame.Surface((CAR_WIDTH, CAR_LENGTH))
+        self.base_image.fill([random.randint(50, 255) for _ in range(3)])
+        if direction == 'h':
+            self.base_image = pygame.transform.rotate(self.base_image, 90)
+        if speed < 0:
+            self.base_image = pygame.transform.rotate(self.base_image, 180)
+
+        self.image = self.base_image.copy()
+        self.pos = pygame.Vector2(pos)
+        self.direction = direction
+        self.speed = speed
+        self.lane = lane
+        self.reverse = reverse
+        self.road = road
+        self.target_speed = self._get_target_speed()
+
+    def _get_target_speed(self):
+        limit = self.road.S_speed_limit_mph if self.reverse else self.road.N_speed_limit_mph
+        speed = random.uniform(0.9 * limit, 1.3 * limit) * MPH_TO_PPF
+        return speed * (-1 if self.reverse else 1)
+
+    def update(self, cars, divider):
+        """Update car movement, lane changing, and divider reactions."""
+        pos_attr = 'y' if self.direction == 'v' else 'x'
+        self_pos = getattr(self.pos, pos_attr)
+
+        # Find nearest car ahead in the same lane
+        block, current_gap = None, float("inf")
+        for car in cars:
+            if car is self or car.lane != self.lane or car.direction != self.direction or car.reverse != self.reverse:
+                continue
+            delta = getattr(car.pos, pos_attr) - self_pos
+            if (not self.reverse and 0 < delta < current_gap) or (self.reverse and delta < 0 and abs(delta) < current_gap):
+                block, current_gap = car, abs(delta)
+
+        # Safety check for lane changes
+        def can_change_lane(new_lane):
+            if new_lane < 0 or new_lane >= self.road.lanes:
+                return False
+
+            candidates = [c for c in cars if c.lane == new_lane and c.reverse == self.reverse]
+            front = [c for c in candidates if getattr(c.pos, pos_attr) - self_pos > 0]
+            rear = [c for c in candidates if getattr(c.pos, pos_attr) - self_pos < 0]
+
+            gap_front = abs(min((getattr(c.pos, pos_attr) - self_pos) for c in front)) if front else float("inf")
+            gap_rear = abs(max((getattr(c.pos, pos_attr) - self_pos) for c in rear)) if rear else float("inf")
+
+            safe_gap = max(abs(self.speed) * 2*FPS, 5)
+            min_gap_improvement = abs(self.speed) * FPS * 3
+
+            if gap_rear >= safe_gap and gap_front >= safe_gap and block:
+                if gap_front > current_gap + min_gap_improvement:
+                    return True
+            return False
+
+        # Attempt lane change if blocked
+        safe_gap = (abs(self.speed) * 1 * FPS)
+
+        if block and current_gap < safe_gap:
+            half = divider.lane
+            if divider and divider.active and divider.pos.y + 50 > self.pos.y:
+                half +=1
+            min_lane = half if self.reverse else 0
+            max_lane = self.road.lanes if self.reverse else half
+            for offset in [ 1]:
+                new_lane = self.lane + offset if not self.reverse else self.lane - offset
+                if min_lane <= new_lane < max_lane and can_change_lane(new_lane):
+                    self._change_lane(new_lane)
+
+        # Adjust speed
+        target = self.target_speed * random.uniform(0.9, 1.1)
+        if block and current_gap < abs(self.speed) * 1 * FPS:
+            desired = self.speed * 0.9
+            desired = -abs(desired) if self.reverse else abs(desired)
+            target = min(desired, self.target_speed) if not self.reverse else max(desired, self.target_speed)
+        else:
+           target = min(target*1.1, self.target_speed) if not self.reverse else max(target*1.1, self.target_speed)
+         
+         
+        if divider and divider.active:
+            if self.lane == divider.lane:
+                if self.reverse != divider.reverse:
+                    self.image.fill([100, 100, 100])
+                    self.react_to_divider(divider, can_change_lane)
+                else:
+                    if divider.pos.y > self.pos.y and divider.pos.y - self.pos.y < 30:
+                        self.speed *= 0.85
+                
+        self._adjust_speed(target)
+
+
+
+        # Move car
+        move = pygame.Vector2(0, self.speed) if self.direction == 'v' else pygame.Vector2(self.speed, 0)
+        self.pos += move
+
+    def react_to_divider(self, divider, can_change_lane):
+        lane_shift = divider.lane
+        divider_y = divider.pos.y
+        car_y = self.pos.y
+
+        if car_y > divider_y and car_y - divider_y <= 200:
+            self.try_merge(-lane_shift, can_change_lane, force_merge=True)
+
+    def try_merge(self, lane_shift, can_change_lane, force_merge=False):
+        new_lane = self.lane +1 # hard code
+        if can_change_lane(new_lane):
+            self._change_lane(new_lane)
+        elif force_merge:
+                # Force merge even if not perfectly safe
+            self._change_lane(new_lane)
+            self.speed *= 0.9  # Slow to avoid collisions
+
+    def _change_lane(self, new_lane):
+        self.lane = new_lane
+        offset = -ROAD_WIDTH / 2 + (self.lane + 0.5) * (ROAD_WIDTH / self.road.lanes)
+        self.pos.x = self.road.position + offset
+
+    def _adjust_speed(self, target):
+        delta = 0.1 * (1 if target > self.speed else -1)
+        self.speed += delta
+        if (delta > 0 and self.speed > target) or (delta < 0 and self.speed < target):
+            self.speed = target
+
+    def draw(self, screen, cam):
+        p = cam.apply(self.pos)
+        size = (int(self.base_image.get_width() * cam.zoom), int(self.base_image.get_height() * cam.zoom))
+        self.image = pygame.transform.scale(self.base_image, size)
+        screen.blit(self.image, self.image.get_rect(center=p))
+
+    def collides_with_rect(self, rect):
+        car_rect = pygame.Rect(
+            self.pos.x - CAR_WIDTH / 2,
+            self.pos.y - CAR_LENGTH / 2,
+            CAR_WIDTH,
+            CAR_LENGTH
+        )
+        return car_rect.colliderect(rect)
+
+class Divider(pygame.sprite.Sprite):
+    def __init__(self, pos, direction, speed, road, lane):
+        super().__init__()
+        self.pos = pygame.Vector2(pos)
+        self.direction = direction  # 'v' = vertical, 'h' = horizontal
+        self.speed = speed
+        self.reverse = speed < 0
+        self.road = road
+        self.lane = lane
+        self.active = False  # starts inactive
+        self.lines = pygame.sprite.Group()
+
+    def update(self):
+        if self.active:
+            move = pygame.Vector2(0, self.speed) if self.direction == 'v' else pygame.Vector2(self.speed, 0)
+            self.pos += move
+
+    def draw(self, screen, cam):
+        offset = 6
+        color = (255, 255, 0) 
+        if self.active:
+            p1 = cam.apply(pygame.Vector2(self.pos.x - offset, self.pos.y + offset))
+            p2 = cam.apply(pygame.Vector2(self.pos.x + offset, self.pos.y - offset))
+            pygame.draw.line(screen, color, p1, p2, max(1, int(2 * cam.zoom)))
+
+            p1 = cam.apply(pygame.Vector2(self.pos.x - offset, self.pos.y+offset))
+            p2 = cam.apply(pygame.Vector2(self.pos.x - offset, 10000))
+            pygame.draw.line(screen, ((255,0, 0)), p1, p2, max(1, int(2 * cam.zoom)))
+
+            p2 = cam.apply(pygame.Vector2(self.pos.x + offset, self.pos.y-offset))
+            p1 = cam.apply(pygame.Vector2(self.pos.x + offset, -10000))
+            pygame.draw.line(screen, ((255, 0, 0)), p1, p2, max(1, int(2 * cam.zoom)))
+        else:
+            p1 = cam.apply(pygame.Vector2(self.pos.x + offset, -10000))
+            p2 = cam.apply(pygame.Vector2(self.pos.x + offset, 10000))
+            pygame.draw.line(screen, ((255,0, 0)), p1, p2, max(1, int(2 * cam.zoom)))
+
+class InputBox:
+    def __init__(self, x, y, w, h, font, initial_text):
+        self.rect = pygame.Rect(x, y, w, h)
+        self.color_inactive = (180, 180, 180)
+        self.color_active = (200, 200, 255)
+        self.color = self.color_inactive
+        self.text = initial_text
+        self.font = font
+        self.txt_surface = font.render(initial_text, True, (0, 0, 0))
+        self.active = False
+        self.returned_text = None
+
+    def handle_event(self, event):
+        self.returned_text = None
+        if event.type == pygame.MOUSEBUTTONDOWN:
+            self.active = self.rect.collidepoint(event.pos)
+        elif event.type == pygame.KEYDOWN and self.active:
+            if event.key == pygame.K_RETURN:
+                self.returned_text = self.text
+                self.active = False
+            elif event.key == pygame.K_BACKSPACE:
+                self.text = self.text[:-1]
+            elif event.unicode.isnumeric():
+                self.text += event.unicode
+
+        self.color = self.color_active if self.active else self.color_inactive
+        self.txt_surface = self.font.render(self.text, True, (0, 0, 0))
+
+    def draw(self, screen):
+        pygame.draw.rect(screen, self.color, self.rect, border_radius=4)
+        screen.blit(self.txt_surface, (self.rect.x + 5, self.rect.y + 5))
+
+class DataFrame:
+    def __init__(self, width, height):
+        self.w = width
+        self.h = height
+        self.color = (255, 0, 0)
+    
+    def car_in_rect(self, posx, posy):
+        half_w = self.w / 2
+        half_h = self.h / 2
+
+        return (
+            -half_w <= posx <= half_w and
+            -half_h <= posy <= half_h
+        )
+            
+    
+    def draw(self, screen, cam):
+        p1 = cam.apply(pygame.Vector2(-self.w/2, -self.h/2))
+        p2 = cam.apply(pygame.Vector2(-self.w/2, self.h/2))
+        p3 = cam.apply(pygame.Vector2(self.w/2, -self.h/2))
+        p4 = cam.apply(pygame.Vector2(self.w/2, self.h/2))
+        
+        pygame.draw.line(screen, self.color, p1, p2, max(1, int(2 * cam.zoom)))
+        pygame.draw.line(screen, self.color, p2, p4, max(1, int(2 * cam.zoom)))
+        pygame.draw.line(screen, self.color, p4, p3, max(1, int(2 * cam.zoom)))
+        pygame.draw.line(screen, self.color, p3, p1, max(1, int(2 * cam.zoom)))
+
+class TrafficSimulator:
+    def __init__(self):
+        pygame.init()
+        self.screen = pygame.display.set_mode((WIDTH, HEIGHT))
+        pygame.display.set_caption("Traffic Simulator")
+        self.clock = pygame.time.Clock()
+        self.font = pygame.font.SysFont(None, 24)
+
+        self.cars = pygame.sprite.Group()
+        self.forward_cars = pygame.sprite.Group()
+        self.reverse_cars = pygame.sprite.Group()
+        self.paused = False
+        self.road_length = -300
+        self.road = Road('v', -150, LANE_NUM, N_speed_limit_mph=70, S_speed_limit_mph=70)
+        self.road.sim = self
+        self.cam = Camera()
+        self.divider_pos = self.road.position - LANE_SIZE/2
+        self.data_frame = DataFrame(DATA_FRAME_X, DATA_FRAME_Y)
+
+        self.divider = Divider(
+            pos=(self.divider_pos, -500),
+            direction='v',
+            speed=0,
+            road=self.road,
+            lane= LANE_NUM//2
+        )
+
+        # Inputs for speed limits and spawn intervals
+        self.forward_speed_input = InputBox(10, 170, 80, 30, self.font, str(self.road.N_speed_limit_mph))
+        self.reverse_speed_input = InputBox(10, 210, 80, 30, self.font, str(self.road.S_speed_limit_mph))
+        self.forward_spawn_input = InputBox(10, 250, 80, 30, self.font, str(N_SPAWN_INTERVAL))
+        self.reverse_spawn_input = InputBox(10, 290, 80, 30, self.font, str(S_SPAWN_INTERVAL))
+
+        # Setup timers
+        pygame.time.set_timer(N_SPAWN_EVENT, N_SPAWN_INTERVAL)
+        pygame.time.set_timer(S_SPAWN_EVENT, S_SPAWN_INTERVAL)
+
+        button_x = WIDTH - 100
+        button_width, button_height, button_spacing = 80, 30, 10
+        self.buttons = [
+            Button('Clear All', (button_x, 10 + (button_height + button_spacing)*6, button_width, button_height), self.cars.empty, self.font),
+            Button('Clear FWD', (button_x, 10 + (button_height + button_spacing)*7, button_width, button_height), self.clear_forward_cars, self.font),
+            Button('Clear REV', (button_x, 10 + (button_height + button_spacing)*8, button_width, button_height), self.clear_reverse_cars, self.font),
+            Button(lambda: 'Resume' if self.paused else 'Pause', (button_x, 10 + (button_height + button_spacing)*9, button_width, button_height), self.toggle_pause, self.font),
+            Button('Reset', (button_x, 10 + (button_height + button_spacing)*10, button_width, button_height), self.reset_simulation, self.font),
+            Button(lambda: 'Move Divider', (button_x, 10 + (button_height + button_spacing)*11, button_width, button_height), self.changeLaneDirection, self.font)
+        ]
+
+    def clear_forward_cars(self):
+        for car in self.forward_cars:
+            car.kill()
+
+    def clear_reverse_cars(self):
+        for car in self.reverse_cars:
+            car.kill()
+
+    def toggle_pause(self):
+        self.paused = not self.paused
+
+    def changeLaneDirection(self):
+
+        forward_num = len(self.forward_cars)
+        reverse_num = len(self.reverse_cars)
+        
+        if not self.divider.active:
+            if forward_num > reverse_num * 2:
+                # Activate divider for forward-heavy traffic
+                self.divider.pos = pygame.Vector2(self.divider_pos + LANE_SIZE, -500)
+                self.divider.speed = 1
+                self.divider.active = True
+
+            elif reverse_num > forward_num * 2:
+                # Activate divider for reverse-heavy traffic
+                self.divider.pos = pygame.Vector2(self.divider_pos - LANE_SIZE, 500)
+                self.divider.speed = -1
+                self.divider.active = True
+
+            
+    
+    def _choose_lane(self, direction, half):
+        if direction == 0:  # southbound/spawning forward
+            lane = random.randrange(half, self.road.lanes)
+        elif direction == 1:  # northbound/reverse
+            lane = random.randrange(half)
+        reverse = lane >= half
+        return lane, reverse
+
+    def _initial_spawn_pos(self, lane, reverse):
+        offset = -ROAD_WIDTH / 2 + (lane + 0.5) * (ROAD_WIDTH / self.road.lanes)
+        x = (self.road.position + offset) 
+
+        same_lane = [c for c in self.cars if c.lane == lane and c.reverse == reverse]
+
+        # Define spawn edge position depending on direction
+        min_spawn = self.road_length if reverse else -self.road_length
+        
+        if not reverse:
+            # Cars move down (increasing y), so farthest back is min y
+            if same_lane:
+                farthest_back = min(c.pos.y for c in same_lane)
+                y = min(farthest_back - CAR_LENGTH * 1.2, min_spawn)
+            else:
+                y = min_spawn
+        else:
+            # Cars move up (decreasing y), farthest back is max y
+            if same_lane:
+                farthest_back = max(c.pos.y for c in same_lane)
+                y = max(farthest_back + CAR_LENGTH * 1.2, min_spawn)
+            else:
+                y = min_spawn
+
+        return x, y
+
+    def _random_speed(self, direction, reverse):
+        limit = self.road.S_speed_limit_mph if direction == 0 else self.road.N_speed_limit_mph
+        speed = random.uniform(0.7 * limit, limit) * MPH_TO_PPF
+        return -speed if reverse else speed
+
+    def spawn_car(self, num, direction):
+        half = self.divider.lane
+        base_offset = CAR_LENGTH * 1.2
+        max_attempts = 6
+
+        while num > 0:
+            lane, reverse = self._choose_lane(direction, half)
+            x, y = self._initial_spawn_pos(lane, reverse)
+            speed = self._random_speed(direction, reverse)
+
+            for attempt in range(max_attempts):
+                offset = base_offset * (2 ** attempt) + random.uniform(0, base_offset)
+                spawn_y = y + ((-1 if not reverse else 1)) * offset
+                spawn_pos = pygame.Vector2(x, spawn_y)
+                new_rect = pygame.Rect(
+                    spawn_pos.x - CAR_WIDTH/2, spawn_pos.y - CAR_LENGTH/2,
+                    CAR_WIDTH, CAR_LENGTH
+                )
+
+                # Use the Car's own collision method
+                if not any(car.collides_with_rect(new_rect) for car in self.cars):
+                    new_car = Car(spawn_pos, 'v', speed, lane, reverse, self.road)
+                    self.cars.add(new_car)
+                    break
+
+            num -= 1
+
+    
+    def get_average_speed(self):
+
+        forward_speeds = [abs(car.speed) / MPH_TO_PPF for car in self.forward_cars]
+        reverse_speeds = [abs(car.speed) / MPH_TO_PPF for car in self.reverse_cars]
+
+        avg_forward = sum(forward_speeds) / len(forward_speeds) if forward_speeds else 0
+        avg_reverse = sum(reverse_speeds) / len(reverse_speeds) if reverse_speeds else 0
+
+        return avg_forward, avg_reverse
+
+    def reset_simulation(self):
+        self.cars.empty()
+        self.road.N_speed_limit_mph = 25
+        self.road.S_speed_limit_mph = 25
+        self.cam = Camera()
+        self.paused = False
+        self.road_length = 500
+
+    def handle_input_box(self, input_box, attr_name, obj, min_val, max_val):
+        if input_box.returned_text:
+            try:
+                value = int(input_box.returned_text)
+                value = max(min_val, min(max_val, value))
+                setattr(obj, attr_name, value)
+            except ValueError:
+                pass
+
+    def update_spawn_timer(self, event_id, input_box, current_interval_attr):
+        try:
+            value = int(input_box.returned_text)
+            if 100 <= value <= 10000 and value != current_interval_attr[0]:
+                current_interval_attr[0] = value
+                pygame.time.set_timer(event_id, value)
+        except Exception:
+            pass
+
+    def run(self):
+        running = True
+        speeds_fwd, speeds_rev, time_steps = [], [], []
+        frame_count = 0
+        step = 0
+        graph_shown = False
+        
+
+        graph = PygameGraph(width=300, height=150, max_points=100, position=(WIDTH-320, 10))
+
+
+        running = True
+        while running:
+            for event in pygame.event.get():
+                self.cam.handle_event(event)
+                if event.type == pygame.QUIT:
+                    running = False
+                elif event.type == N_SPAWN_EVENT and not self.paused:
+                    self.spawn_car(1, 1)
+                elif event.type == S_SPAWN_EVENT and not self.paused:
+                    self.spawn_car(1, 0)
+                elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    for btn in self.buttons:
+                        btn.click(event.pos)
+
+                # Handle input boxes...
+                self.forward_speed_input.handle_event(event)
+                self.reverse_speed_input.handle_event(event)
+                self.forward_spawn_input.handle_event(event)
+                self.reverse_spawn_input.handle_event(event)
+
+            self.handle_input_box(self.forward_speed_input, 'N_speed_limit_mph', self.road, 5, 90)
+            self.handle_input_box(self.reverse_speed_input, 'S_speed_limit_mph', self.road, 5, 90)
+            self.update_spawn_timer(N_SPAWN_EVENT, self.forward_spawn_input, [N_SPAWN_INTERVAL])
+            self.update_spawn_timer(S_SPAWN_EVENT, self.reverse_spawn_input, [S_SPAWN_INTERVAL])
+
+            if not self.paused:
+                for car in self.cars:
+                    if car.reverse:
+                        if self.data_frame.car_in_rect(car.pos.x, car.pos.y):
+                            self.reverse_cars.add(car)
+                        elif self.reverse_cars.__contains__(car):
+                            self.reverse_cars.remove(car)
+                        elif car.pos.y < -3000:
+                            car.kill()
+                    else:
+                        if self.data_frame.car_in_rect(car.pos.x, car.pos.y):
+                            self.forward_cars.add(car)
+                        elif self.forward_cars.__contains__(car):
+                            self.forward_cars.remove(car)
+                        elif car.pos.y > 3000:
+                            car.kill()
+                    car.update(self.cars, self.divider)
+                if self.divider and self.divider.active:
+                    self.divider.update()
+                    if self.divider.pos.y > HEIGHT + 100:  # off-screen
+                        self.divider.lane += 1
+                        self.divider.active = False
+
+            # --- Update Pygame screen ---
+            self.screen.fill(BG_COLOR)
+            self.road.draw(self.screen, self.cam)
+            
+            for car in self.cars:
+                car.draw(self.screen, self.cam)
+            for btn in self.buttons:
+                btn.draw(self.screen)
+            if self.divider:
+                self.divider.draw(self.screen, self.cam)
+            self.data_frame.draw(self.screen, self.cam)
+            self.forward_speed_input.draw(self.screen)
+            self.reverse_speed_input.draw(self.screen)
+            self.forward_spawn_input.draw(self.screen)
+            self.reverse_spawn_input.draw(self.screen)
+
+
+            avg_fwd, avg_rev = self.get_average_speed()
+
+
+            graph.add_data(avg_fwd, avg_rev)
+            graph.draw(self.screen)
+
+            frame_count += 1
+            if not self.paused and frame_count % (1 * FPS) == 0:
+                step += 2
+                speeds_fwd.append(avg_fwd)
+                speeds_rev.append(avg_rev)
+                time_steps.append(step)
+
+            info = [
+                f"Speed Limit: {self.road.N_speed_limit_mph}/{self.road.S_speed_limit_mph} MPH",
+                f"Avg Speed (Forward): {avg_fwd:.1f} MPH",
+                f"Avg Speed (Reverse): {avg_rev:.1f} MPH",
+                f"Road Length: {self.road_length}px"
+            ]
+            for i, line in enumerate(info):
+                self.screen.blit(self.font.render(line, True, (0, 0, 0)), (10, 50 + i*20))
+            if self.paused:
+                self.screen.blit(self.font.render("PAUSED", True, (200, 0, 0)), (10, 130))
+                if not graph_shown:
+                    plt.figure(figsize=(8,5))
+                    plt.plot(time_steps, speeds_fwd, label="Forward Lane", linewidth=2)
+                    plt.plot(time_steps, speeds_rev, label="Reverse Lane", linewidth=2)
+                    plt.xlabel("Time (seconds)")
+                    plt.ylabel("Average Speed (MPH)")
+                    plt.title("Average Speed in Forward vs Reverse Lanes")
+                    plt.legend()
+                    plt.grid(True)
+                    plt.show()
+                    # After showing graph, unpause to continue sim if user resumes
+                    graph_shown = True
+            else:
+                graph_shown = False
+            
+
+            pygame.display.flip()
+            self.clock.tick(FPS)
+
+        graph.close()
+        pygame.quit()
+        sys.exit()
+
+
+class PygameGraph:
+    def __init__(self, width=300, height=150, max_points=100, position=(WIDTH-320, HEIGHT-170)):
+        self.width = width
+        self.height = height
+        self.max_points = max_points
+        self.position = position  # top-left of the graph on screen
+        self.fwd_data = []
+        self.rev_data = []
+        self.fwd_color = (0, 0, 255)
+        self.rev_color = (255, 0, 0)
+        self.bg_color = (230, 230, 230)
+        self.border_color = (0, 0, 0)
+        self.margin = 10  # padding inside graph
+
+    def add_data(self, fwd_value, rev_value):
+        self.fwd_data.append(fwd_value)
+        self.rev_data.append(rev_value)
+        if len(self.fwd_data) > self.max_points:
+            self.fwd_data.pop(0)
+            self.rev_data.pop(0)
+
+    def draw(self, surface):
+        # Draw background
+        graph_rect = pygame.Rect(self.position[0], self.position[1], self.width, self.height)
+        pygame.draw.rect(surface, self.bg_color, graph_rect)
+        pygame.draw.rect(surface, self.border_color, graph_rect, 2)
+
+        if not self.fwd_data:
+            return
+
+        # Scale data
+        max_speed = max(max(self.fwd_data), max(self.rev_data), 1)
+        x_scale = (self.width - 2*self.margin) / self.max_points
+        y_scale = (self.height - 2*self.margin) / max_speed
+
+        # Draw forward speed line
+        points = []
+        for i, val in enumerate(self.fwd_data):
+            x = self.position[0] + self.margin + i * x_scale
+            y = self.position[1] + self.height - self.margin - val * y_scale
+            points.append((x, y))
+        if len(points) > 1:
+            pygame.draw.lines(surface, self.fwd_color, False, points, 2)
+
+        # Draw reverse speed line
+        points = []
+        for i, val in enumerate(self.rev_data):
+            x = self.position[0] + self.margin + i * x_scale
+            y = self.position[1] + self.height - self.margin - val * y_scale
+            points.append((x, y))
+        if len(points) > 1:
+            pygame.draw.lines(surface, self.rev_color, False, points, 2)
+
+        
+
+if __name__ == "__main__":
+    TrafficSimulator().run()
+
+    
